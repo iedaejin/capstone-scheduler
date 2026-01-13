@@ -182,7 +182,8 @@ def schedule_defenses(
     projects_df: pd.DataFrame,
     panel_assignment_df: pd.DataFrame,
     slots_df: pd.DataFrame,
-    availability_df: pd.DataFrame
+    availability_df: pd.DataFrame,
+    max_rooms: int = None
 ) -> Tuple[pd.DataFrame, bool]:
     """
     Schedules projects into time slots using MILP optimization.
@@ -192,6 +193,7 @@ def schedule_defenses(
         panel_assignment_df: DataFrame with columns [project_id, panelist_id]
         slots_df: DataFrame with columns [slot_id, date, time] (room optional)
         availability_df: DataFrame with panelist_id and slot_id columns (1/0 for availability)
+        max_rooms: Maximum number of rooms available (limits concurrent defenses per time slot)
     
     Returns:
         Tuple of (schedule DataFrame, success boolean)
@@ -256,6 +258,30 @@ def schedule_defenses(
             solver.Add(
                 sum(x[i, t] for i in assigned_projects) <= 1
             )
+    
+    # Constraint: Limit concurrent defenses per time slot (room constraint)
+    if max_rooms is not None:
+        for t in slots_df.slot_id:
+            # At most max_rooms projects can be scheduled in the same time slot
+            solver.Add(
+                sum(x[i, t] for i in projects_df.project_id) <= max_rooms
+            )
+    
+    # Objective: Minimize maximum defenses per day (encourage distribution across days)
+    # Create a variable for maximum defenses per day
+    unique_dates = slots_df['date'].unique()
+    max_defenses_per_day = solver.NumVar(0, len(projects_df), "max_defenses_per_day")
+    
+    # For each date, count how many projects are scheduled
+    for date in unique_dates:
+        date_slots = slots_df[slots_df['date'] == date]['slot_id'].tolist()
+        # Sum of all projects scheduled in slots on this date
+        defenses_on_date = sum(x[i, t] for i in projects_df.project_id for t in date_slots)
+        # This date's count should be <= max_defenses_per_day
+        solver.Add(defenses_on_date <= max_defenses_per_day)
+    
+    # Set objective: minimize maximum defenses per day (to distribute evenly)
+    solver.Minimize(max_defenses_per_day)
     
     # Constraint 4: Prevent consecutive slots for same panelist (defenses may take 1 hour)
     # Only apply if slots are 30 minutes or less (to avoid over-constraining)
@@ -328,12 +354,17 @@ def schedule_defenses(
     
     # Solve
     print(f"Solving scheduling problem: {len(projects_df)} projects, {len(slots_df)} slots...")
+    print(f"Objective: Minimize maximum defenses per day (distribute across {len(unique_dates)} days)")
     status = solver.Solve()
     
     if status == pywraplp.Solver.OPTIMAL:
         print("✅ Optimal solution found!")
+        if max_defenses_per_day.solution_value() is not None:
+            print(f"📊 Maximum defenses per day: {max_defenses_per_day.solution_value():.1f}")
     elif status == pywraplp.Solver.FEASIBLE:
         print("✅ Feasible solution found (may not be optimal)")
+        if max_defenses_per_day.solution_value() is not None:
+            print(f"📊 Maximum defenses per day: {max_defenses_per_day.solution_value():.1f}")
     elif status == pywraplp.Solver.INFEASIBLE:
         print("❌ Problem is infeasible - no solution exists")
     elif status == pywraplp.Solver.NOT_SOLVED:
@@ -372,9 +403,8 @@ def schedule_defenses(
         
         schedule_df = pd.DataFrame(schedule)
         
-        # Compute and assign rooms to each scheduled project
-        # Assign rooms based on concurrent defenses (same date and time)
-        schedule_df = assign_rooms_to_schedule(schedule_df)
+        # Room assignment will be done by match_defenses_and_panelists with max_rooms parameter
+        # Don't assign rooms here - just return the schedule
         
         return schedule_df, True
     else:
@@ -511,13 +541,15 @@ def schedule_defenses(
         return pd.DataFrame(), False
 
 
-def assign_rooms_to_schedule(schedule_df: pd.DataFrame) -> pd.DataFrame:
+def assign_rooms_to_schedule(schedule_df: pd.DataFrame, max_rooms: int = None) -> pd.DataFrame:
     """
     Assigns rooms to scheduled projects based on concurrent defenses.
     Projects scheduled at the same date and time get different rooms.
     
     Args:
         schedule_df: DataFrame with scheduled projects (must have 'date', 'time' columns)
+        max_rooms: Maximum number of rooms available. If None, assigns rooms as needed.
+                   If specified, ensures no more than max_rooms are used per time slot.
     
     Returns:
         DataFrame with 'room' column added
@@ -533,20 +565,47 @@ def assign_rooms_to_schedule(schedule_df: pd.DataFrame) -> pd.DataFrame:
     grouped = schedule_df.groupby(['date', 'time'])
     
     max_rooms_needed = 0
+    room_overflow_warnings = []
+    
     for (date, time), group in grouped:
         num_concurrent = len(group)
         
-        # Assign rooms: R1, R2, R3, etc.
-        for idx, row_idx in enumerate(group.index):
+        # Check if we exceed max_rooms limit
+        if max_rooms is not None and num_concurrent > max_rooms:
+            room_overflow_warnings.append({
+                'date': date,
+                'time': time,
+                'concurrent': num_concurrent,
+                'max_rooms': max_rooms
+            })
+        
+        # Assign rooms: R1, R2, R3, etc. (up to max_rooms if specified)
+        rooms_to_assign = min(num_concurrent, max_rooms) if max_rooms is not None else num_concurrent
+        
+        for idx, row_idx in enumerate(group.index[:rooms_to_assign]):
             room_name = f"R{idx + 1}"
             schedule_df.loc[schedule_df.index == row_idx, 'room'] = room_name
+        
+        # Mark excess projects as needing room assignment
+        if max_rooms is not None and num_concurrent > max_rooms:
+            for idx, row_idx in enumerate(group.index[max_rooms:]):
+                schedule_df.loc[schedule_df.index == row_idx, 'room'] = f"R{max_rooms}+ (overflow)"
         
         # Track maximum rooms needed
         if num_concurrent > max_rooms_needed:
             max_rooms_needed = num_concurrent
     
     if max_rooms_needed > 0:
-        print(f"Room assignment: Maximum {max_rooms_needed} rooms needed for concurrent defenses")
+        if max_rooms is not None:
+            print(f"Room assignment: Using {max_rooms} rooms (maximum {max_rooms_needed} concurrent defenses detected)")
+            if room_overflow_warnings:
+                print(f"⚠️  Warning: {len(room_overflow_warnings)} time slots have more concurrent defenses than available rooms!")
+                for warning in room_overflow_warnings[:5]:  # Show first 5
+                    print(f"   - {warning['date']} {warning['time']}: {warning['concurrent']} defenses, but only {warning['max_rooms']} rooms")
+                if len(room_overflow_warnings) > 5:
+                    print(f"   ... and {len(room_overflow_warnings) - 5} more")
+        else:
+            print(f"Room assignment: Maximum {max_rooms_needed} rooms needed for concurrent defenses")
     
     return schedule_df
 
@@ -556,7 +615,8 @@ def match_defenses_and_panelists(
     panelists_df: pd.DataFrame,
     panelist_topics_df: pd.DataFrame,
     slots_df: pd.DataFrame,
-    availability_df: pd.DataFrame
+    availability_df: pd.DataFrame,
+    max_rooms: int = None
 ) -> Dict:
     """
     Complete algorithm to match capstone defenses with panelists and schedule them.
@@ -565,8 +625,9 @@ def match_defenses_and_panelists(
         projects_df: DataFrame with columns [project_id, topic, supervisor, required_panelists]
         panelists_df: DataFrame with columns [panelist_id, max_panels]
         panelist_topics_df: DataFrame with panelist_id and topic columns (1/0 for expertise)
-        slots_df: DataFrame with columns [slot_id, date, time, room]
+        slots_df: DataFrame with columns [slot_id, date, time] (room optional)
         availability_df: DataFrame with panelist_id and slot_id columns (1/0 for availability)
+        max_rooms: Maximum number of rooms available. If None, assigns rooms as needed.
     
     Returns:
         Dictionary containing:
@@ -586,8 +647,12 @@ def match_defenses_and_panelists(
     # Step 3: Schedule defenses
     if assign_success:
         schedule, schedule_success = schedule_defenses(
-            projects_df, panel_assignment, slots_df, availability_df
+            projects_df, panel_assignment, slots_df, availability_df, max_rooms=max_rooms
         )
+        
+        # Step 4: Assign rooms with max_rooms constraint
+        if schedule_success and not schedule.empty:
+            schedule = assign_rooms_to_schedule(schedule, max_rooms=max_rooms)
     else:
         schedule = pd.DataFrame()
         schedule_success = False

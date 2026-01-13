@@ -104,13 +104,40 @@ def create_calendar_view(schedule_df, slots_df):
         calendar['date'] = pd.to_datetime(calendar['date'])
         # Create datetime for timeline
         if 'time' in calendar.columns:
-            # Extract start time from time range (e.g., "09-10" -> "09:00")
-            time_start = calendar['time'].str.split('-').str[0] + ':00'
+            # Extract start time from time range (e.g., "09:30-10:00" -> "09:30" or "09-10" -> "09:00")
+            def parse_time_start(time_str):
+                start_time = str(time_str).split('-')[0]
+                # If format is "HH:MM", use as is; if "HH", add ":00"
+                if ':' in start_time:
+                    return start_time
+                else:
+                    return start_time + ':00'
+            
+            time_starts = calendar['time'].apply(parse_time_start)
             calendar['datetime'] = pd.to_datetime(
-                calendar['date'].astype(str) + ' ' + time_start,
+                calendar['date'].astype(str) + ' ' + time_starts,
                 format='%Y-%m-%d %H:%M',
                 errors='coerce'
             )
+            
+            # Calculate duration for Gantt chart
+            def parse_time_duration(time_str):
+                time_parts = str(time_str).split('-')
+                if len(time_parts) == 2:
+                    start_str = time_parts[0]
+                    end_str = time_parts[1]
+                    # Handle both formats: "HH:MM" and "HH"
+                    if ':' in start_str and ':' in end_str:
+                        start_h, start_m = map(int, start_str.split(':'))
+                        end_h, end_m = map(int, end_str.split(':'))
+                    else:
+                        start_h, start_m = int(start_str), 0
+                        end_h, end_m = int(end_str), 0
+                    duration_minutes = (end_h * 60 + end_m) - (start_h * 60 + start_m)
+                    return duration_minutes
+                return 30  # default to 30 minutes
+            
+            calendar['duration_minutes'] = calendar['time'].apply(parse_time_duration)
     else:
         st.error("Date column not found in schedule data")
         return None
@@ -226,6 +253,20 @@ with st.sidebar:
     st.markdown("---")
     st.header("⚙️ Settings")
     
+    # Room configuration
+    if st.session_state.data_loaded:
+        st.subheader("Room Configuration")
+        max_rooms = st.number_input(
+            "Maximum Number of Rooms",
+            min_value=1,
+            max_value=20,
+            value=4,
+            help="Maximum number of rooms available for concurrent defenses"
+        )
+        st.session_state.max_rooms = max_rooms
+    else:
+        st.session_state.max_rooms = 4  # Default value
+    
     # Run algorithm button
     if st.session_state.data_loaded:
         if st.button("🚀 Run Scheduling Algorithm", type="primary", use_container_width=True):
@@ -244,7 +285,8 @@ with st.sidebar:
                         st.session_state.panelists,
                         st.session_state.panelist_topics,
                         st.session_state.slots,
-                        st.session_state.availability
+                        st.session_state.availability,
+                        max_rooms=st.session_state.max_rooms
                     )
                     st.session_state.result = result
                 finally:
@@ -408,17 +450,34 @@ else:
                 
                 # Gantt chart
                 st.subheader("Gantt Chart View")
-                fig = px.timeline(
-                    calendar,
-                    x_start='datetime',
-                    x_end=calendar['datetime'] + pd.Timedelta(hours=1),
-                    y='project_id',
-                    color='topic',
-                    labels={'project_id': 'Project', 'datetime': 'Time'},
-                    title="Defense Schedule Timeline"
-                )
-                fig.update_layout(yaxis_autorange="reversed")
-                st.plotly_chart(fig, use_container_width=True)
+                
+                # Create end datetime based on duration
+                if 'duration_minutes' in calendar.columns:
+                    calendar['datetime_end'] = calendar['datetime'] + pd.to_timedelta(calendar['duration_minutes'], unit='m')
+                else:
+                    # Fallback: assume 30 minutes if duration not calculated
+                    calendar['datetime_end'] = calendar['datetime'] + pd.Timedelta(minutes=30)
+                
+                # Filter out any rows with invalid datetime
+                calendar_gantt = calendar.dropna(subset=['datetime', 'datetime_end'])
+                
+                if not calendar_gantt.empty:
+                    fig = px.timeline(
+                        calendar_gantt,
+                        x_start='datetime',
+                        x_end='datetime_end',
+                        y='project_id',
+                        color='topic',
+                        labels={'project_id': 'Project', 'datetime': 'Time'},
+                        title="Defense Schedule Timeline"
+                    )
+                    fig.update_layout(
+                        yaxis_autorange="reversed",
+                        height=max(600, len(calendar_gantt) * 30)  # Adjust height based on number of projects
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning("No valid datetime data available for Gantt chart.")
         else:
             st.info("Run the scheduling algorithm to see the calendar view.")
     
@@ -474,34 +533,73 @@ else:
                 schedule_display = schedule.copy()
                 schedule_display['date'] = schedule_display['date'].dt.strftime('%Y-%m-%d')
                 
+                # Statistics
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Total Scheduled", len(schedule))
+                with col2:
+                    unique_dates = schedule['date'].nunique()
+                    st.metric("Days", unique_dates)
+                with col3:
+                    if 'room' in schedule.columns:
+                        unique_rooms = schedule['room'].nunique()
+                        st.metric("Rooms Used", unique_rooms)
+                    else:
+                        st.metric("Rooms Used", "N/A")
+                with col4:
+                    # Show date range
+                    min_date = schedule['date'].min().strftime('%Y-%m-%d')
+                    max_date = schedule['date'].max().strftime('%Y-%m-%d')
+                    st.metric("Date Range", f"{min_date} to {max_date}")
+                
+                # Date filter
+                all_dates = sorted(schedule_display['date'].unique())
+                st.subheader("Filter by Date")
+                col_filter1, col_filter2 = st.columns([3, 1])
+                with col_filter1:
+                    selected_dates = st.multiselect(
+                        "Select dates to display (leave empty to show all)",
+                        all_dates,
+                        default=all_dates,
+                        help="Select specific dates to view, or leave empty to see all dates"
+                    )
+                with col_filter2:
+                    show_all = st.button("Show All Dates", use_container_width=True)
+                    if show_all:
+                        selected_dates = all_dates
+                
+                # Filter schedule based on selected dates
+                if selected_dates:
+                    filtered_schedule = schedule_display[schedule_display['date'].isin(selected_dates)]
+                else:
+                    filtered_schedule = schedule_display
+                
+                # Group by date for better visualization
+                st.subheader("Schedule by Date")
+                for date in sorted(filtered_schedule['date'].unique()):
+                    day_schedule = filtered_schedule[filtered_schedule['date'] == date].sort_values('time')
+                    with st.expander(f"📅 {date} ({len(day_schedule)} defenses)", expanded=True):
+                        st.dataframe(
+                            day_schedule[['time'] + (['room'] if 'room' in day_schedule.columns else []) + ['project_id', 'topic', 'panelists']],
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                
+                # Full schedule table
+                st.subheader("Complete Schedule")
                 st.dataframe(
-                    schedule_display[['date', 'time'] + (['room'] if 'room' in schedule_display.columns else []) + ['project_id', 'topic', 'panelists']],
-                    use_container_width=True
+                    filtered_schedule[['date', 'time'] + (['room'] if 'room' in filtered_schedule.columns else []) + ['project_id', 'topic', 'panelists']],
+                    use_container_width=True,
+                    hide_index=True
                 )
             else:
                 # Fallback if date is missing
                 st.dataframe(
                     schedule[['slot_id', 'project_id', 'topic', 'panelists']],
-                    use_container_width=True
+                    use_container_width=True,
+                    hide_index=True
                 )
                 st.warning("Date information not available. Showing schedule by slot_id.")
-            
-            # Statistics
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Total Scheduled", len(schedule))
-            with col2:
-                if 'date' in schedule.columns:
-                    unique_dates = schedule['date'].nunique()
-                    st.metric("Days", unique_dates)
-                else:
-                    st.metric("Days", "N/A")
-            with col3:
-                if 'room' in schedule.columns:
-                    unique_rooms = schedule['room'].nunique()
-                    st.metric("Rooms Used", unique_rooms)
-                else:
-                    st.metric("Rooms Used", "N/A")
         else:
             st.info("Run the scheduling algorithm to see schedule details.")
     
