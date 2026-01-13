@@ -1,0 +1,11 @@
+# Alternative package list for Streamlit Cloud if needed
+# Some systems may require this format
+
+streamlit
+pandas
+numpy
+ortools
+plotly
+openpyxl
+xlrd
+
