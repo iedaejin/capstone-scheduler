@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 import io
 from capstone_scheduler import (
     match_defenses_and_panelists,
@@ -9,7 +8,6 @@ from capstone_scheduler import (
     group_panelists_by_topics
 )
 import plotly.express as px
-import plotly.graph_objects as go
 
 # Page configuration
 st.set_page_config(
@@ -45,6 +43,11 @@ st.markdown("""
     }
     </style>
 """, unsafe_allow_html=True)
+
+# Constants
+MAX_ROOMS_DEFAULT = 4
+MAX_ROOMS_MIN = 1
+MAX_ROOMS_MAX = 20
 
 # Initialize session state
 if 'result' not in st.session_state:
@@ -119,25 +122,6 @@ def create_calendar_view(schedule_df, slots_df):
                 format='%Y-%m-%d %H:%M',
                 errors='coerce'
             )
-            
-            # Calculate duration for Gantt chart
-            def parse_time_duration(time_str):
-                time_parts = str(time_str).split('-')
-                if len(time_parts) == 2:
-                    start_str = time_parts[0]
-                    end_str = time_parts[1]
-                    # Handle both formats: "HH:MM" and "HH"
-                    if ':' in start_str and ':' in end_str:
-                        start_h, start_m = map(int, start_str.split(':'))
-                        end_h, end_m = map(int, end_str.split(':'))
-                    else:
-                        start_h, start_m = int(start_str), 0
-                        end_h, end_m = int(end_str), 0
-                    duration_minutes = (end_h * 60 + end_m) - (start_h * 60 + start_m)
-                    return duration_minutes
-                return 30  # default to 30 minutes
-            
-            calendar['duration_minutes'] = calendar['time'].apply(parse_time_duration)
     else:
         st.error("Date column not found in schedule data")
         return None
@@ -167,7 +151,10 @@ def export_results_to_excel(result, projects_df, slots_df):
         summary_data = []
         for _, row in result['schedule'].iterrows():
             project_id = row['project_id']
-            project_info = projects_df[projects_df.project_id == project_id].iloc[0]
+            project_matches = projects_df[projects_df.project_id == project_id]
+            if len(project_matches) == 0:
+                continue  # Skip if project not found
+            project_info = project_matches.iloc[0]
             panelists = result['panel_assignment'][
                 result['panel_assignment'].project_id == project_id
             ]['panelist_id'].tolist()
@@ -258,14 +245,14 @@ with st.sidebar:
         st.subheader("Room Configuration")
         max_rooms = st.number_input(
             "Maximum Number of Rooms",
-            min_value=1,
-            max_value=20,
-            value=4,
+            min_value=MAX_ROOMS_MIN,
+            max_value=MAX_ROOMS_MAX,
+            value=MAX_ROOMS_DEFAULT,
             help="Maximum number of rooms available for concurrent defenses"
         )
         st.session_state.max_rooms = max_rooms
     else:
-        st.session_state.max_rooms = 4  # Default value
+        st.session_state.max_rooms = MAX_ROOMS_DEFAULT
     
     # Run algorithm button
     if st.session_state.data_loaded:
@@ -279,6 +266,7 @@ with st.sidebar:
                 old_stdout = sys.stdout
                 sys.stdout = captured_output = StringIO()
                 
+                result = None
                 try:
                     result = match_defenses_and_panelists(
                         st.session_state.projects,
@@ -289,19 +277,23 @@ with st.sidebar:
                         max_rooms=st.session_state.max_rooms
                     )
                     st.session_state.result = result
+                except Exception as e:
+                    st.error(f"❌ Error during scheduling: {str(e)}")
+                    result = {'success': False, 'error': str(e)}
+                    st.session_state.result = result
                 finally:
                     # Restore stdout
                     sys.stdout = old_stdout
                     output = captured_output.getvalue()
                     
                     # Display diagnostics if any
-                    if output:
-                        with st.expander("📋 Algorithm Diagnostics", expanded=not result['success']):
+                    if output and result is not None:
+                        with st.expander("📋 Algorithm Diagnostics", expanded=not result.get('success', False)):
                             st.text(output)
                 
-                if result['success']:
+                if result is not None and result.get('success', False):
                     st.success("✅ Scheduling completed successfully!")
-                else:
+                elif result is not None:
                     st.error("❌ Scheduling failed. Check constraints.")
                     st.info("💡 Expand 'Algorithm Diagnostics' above to see detailed error information.")
 
@@ -447,37 +439,6 @@ else:
                             st.divider()
                 else:
                     st.info(f"No defenses scheduled on {selected_date}")
-                
-                # Gantt chart
-                st.subheader("Gantt Chart View")
-                
-                # Create end datetime based on duration
-                if 'duration_minutes' in calendar.columns:
-                    calendar['datetime_end'] = calendar['datetime'] + pd.to_timedelta(calendar['duration_minutes'], unit='m')
-                else:
-                    # Fallback: assume 30 minutes if duration not calculated
-                    calendar['datetime_end'] = calendar['datetime'] + pd.Timedelta(minutes=30)
-                
-                # Filter out any rows with invalid datetime
-                calendar_gantt = calendar.dropna(subset=['datetime', 'datetime_end'])
-                
-                if not calendar_gantt.empty:
-                    fig = px.timeline(
-                        calendar_gantt,
-                        x_start='datetime',
-                        x_end='datetime_end',
-                        y='project_id',
-                        color='topic',
-                        labels={'project_id': 'Project', 'datetime': 'Time'},
-                        title="Defense Schedule Timeline"
-                    )
-                    fig.update_layout(
-                        yaxis_autorange="reversed",
-                        height=max(600, len(calendar_gantt) * 30)  # Adjust height based on number of projects
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.warning("No valid datetime data available for Gantt chart.")
         else:
             st.info("Run the scheduling algorithm to see the calendar view.")
     
